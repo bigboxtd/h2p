@@ -1082,8 +1082,7 @@ async def solve_recaptcha(page) -> bool:
       1. 确认 GDPR 弹窗已消失
       2. 等待 anchor iframe 首次完全稳定（checkbox 可见）
          ※ hl=en 已由 add_init_script 在 iframe 创建时注入，无需事后重载
-      3. 路径1：手动点 checkbox，等待直接变绿（省去图片挑战）
-      4. 路径2：出现图片挑战 or 未变绿 → Botright page.solve_recaptcha()
+      3. 直接交给 Botright page.solve_recaptcha() 全程接管（已移除手动点 checkbox 路径）
     """
     # 步骤1：确认 GDPR 已消失
     log.info("solve_recaptcha: 确认 GDPR 弹窗已消失...")
@@ -1110,56 +1109,10 @@ async def solve_recaptcha(page) -> bool:
 
     # 步骤3（已移除）：hl=en 由 add_init_script 在 iframe 创建时直接注入，无需事后重载
 
-    # 步骤4：路径1 —— 手动点 checkbox，等最多 10s 直接变绿
-    log.info("【路径1】点击 checkbox，等待直接通过...")
-    checkbox_clicked = False
-    try:
-        await _click_checkbox(page)
-        checkbox_clicked = True
-        await take_screenshot(page, f"recaptcha_after_click")
-    except Exception as e:
-        log.warning(f"路径1 点击 checkbox 失败: {e}，直接跳路径2")
-
-    if checkbox_clicked:
-        for i in range(10):
-            if await is_recaptcha_solved(page):
-                log.info(f"✅ 路径1 通过（{i}s，无图片挑战）")
-                return True
-            if await is_image_challenge_present(page):
-                log.info(f"  {i}s 出现图片挑战，进入路径2")
-                break
-            await asyncio.sleep(1)
-        else:
-            if await is_recaptcha_solved(page):
-                log.info("✅ 路径1 通过（超时后检测）")
-                return True
-            log.info("路径1 10s 未通过也无图片挑战，进入路径2")
-
-    # ★ Fix3：路径1结束后，等待 anchor checkbox 恢复到未点击状态（aria-checked=false）
-    # 路径1已污染 checkbox 状态，Botright 接管一个"半途而废"状态会让 Google 评分很低
-    log.info("路径1结束，等待 reCAPTCHA checkbox 恢复初始状态（最多12s）...")
-    for _ri in range(12):
-        try:
-            fl_anchor = page.frame_locator("iframe[src*='recaptcha'][src*='anchor']")
-            cb_anchor = fl_anchor.locator("#recaptcha-anchor")
-            aria_val = await cb_anchor.get_attribute("aria-checked", timeout=600)
-            if aria_val == "false":
-                log.info(f"  ✅ checkbox 已恢复初始状态（{_ri}s）")
-                break
-        except Exception:
-            pass
-        await asyncio.sleep(1)
-    else:
-        log.warning("  ⚠️ checkbox 12s 内未恢复初始状态，执行 grecaptcha.reset() 强制重置...")
-        try:
-            await page.evaluate("grecaptcha.reset()")
-            await asyncio.sleep(2)
-        except Exception as _re:
-            log.warning(f"  reset 失败: {_re}")
-
-    # 步骤6：路径2 —— Botright 全程接管（recognizer 已可识别英语标签）
+    # 步骤4：直接交给 Botright 全程接管（已移除手动点 checkbox 的路径1，
+    # 避免污染 checkbox 状态/浪费时间，recognizer 已可识别英语标签）
     await take_screenshot(page, f"recaptcha_before_botright")
-    log.info("【路径2】Botright page.solve_recaptcha() 接管（最多重试3次）...")
+    log.info("Botright page.solve_recaptcha() 接管（最多重试3次）...")
 
     async def _do_botright_attempt(attempt_no: int) -> bool:
         """单次 Botright 解题尝试，带 80s 硬超时。"""
