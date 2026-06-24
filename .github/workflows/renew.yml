@@ -1,0 +1,270 @@
+name: host2play 自动续期 (Botright + 代理)
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      enable_recording:
+        description: '是否录屏（true/false，默认 false）'
+        required: false
+        default: 'false'
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ── 系统依赖缓存 ──────────────────────────────────────────────────────────
+      - name: 缓存 apt 包
+        uses: actions/cache@v4
+        id: cache-apt
+        with:
+          path: |
+            /var/cache/apt/archives
+            /var/lib/apt/lists
+          key: apt-${{ runner.os }}-xvfb-ffmpeg-chromium-fonts-v1
+
+      - name: 安装系统依赖
+        run: |
+          if [ "${{ steps.cache-apt.outputs.cache-hit }}" != "true" ]; then
+            sudo apt-get update -qq
+          fi
+          sudo apt-get install -y -qq \
+            xvfb ffmpeg curl unzip \
+            fonts-noto-cjk \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxfixes3 libxrandr2 libgbm1 \
+            libasound2t64 || sudo apt-get install -y -qq libasound2
+
+      # ── Python 依赖缓存（动态路径，不写死补丁版本号）────────────────────────
+      - name: 获取 Python 路径
+        id: py-paths
+        run: |
+          echo "site_packages=$(python -c 'import site; print(site.getsitepackages()[0])')" >> $GITHUB_OUTPUT
+          echo "bin_dir=$(dirname $(which python))" >> $GITHUB_OUTPUT
+
+      - name: 缓存 pip 包与 Playwright 浏览器
+        uses: actions/cache@v4
+        id: cache-pip
+        with:
+          path: |
+            ~/.cache/pip
+            ${{ steps.py-paths.outputs.site_packages }}
+            ${{ steps.py-paths.outputs.bin_dir }}
+            ~/.cache/ms-playwright
+          key: pip-playwright-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-v2
+
+      - name: 安装 Python 依赖
+        if: steps.cache-pip.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_XET_HIGH_PERFORMANCE: "1"
+        run: |
+          pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+          pip config set global.trusted-host mirrors.aliyun.com
+
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --timeout 120 -q
+
+          pip install "hcaptcha-challenger==0.9.3" --no-deps -q
+          pip install ftfy loguru "numpy<2.0.0" "onnxruntime>=1.17.0" opencv-python pyyaml regex "scikit-image>=0.21.0,<0.22.0" scikit-learn tqdm importlib_metadata -q
+
+          pip install botright --no-deps -q
+          pip install async-class pybrowsers chrome-fingerprints undetected-playwright-patch -q
+
+          pip install recognizer -q
+          pip install playwright requests -q
+
+          pip install -r requirements.txt -q
+
+          pip install "onnx>=1.14.0" -q
+
+          pip install "httpx==0.27.2" -q
+
+          python -c "import hcaptcha_challenger.agents; print('✅ hcaptcha_challenger.agents OK')"
+          HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -c "import botright; print('✅ botright OK')"
+
+          python -m playwright install chromium
+
+      # ── HuggingFace 模型缓存 ──────────────────────────────────────────────────
+      - name: 缓存 HuggingFace 模型
+        uses: actions/cache@v4
+        id: cache-hf
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+            ~/.cache/ultralytics
+            ~/.cache/dannyluna_recaptcha
+          key: hf-models-recognizer-v4
+
+      - name: 预下载 recognizer 模型（带 HF_TOKEN 避免 429）
+        if: steps.cache-hf.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_XET_HIGH_PERFORMANCE: "1"
+          TRANSFORMERS_CACHE: ~/.cache/huggingface
+        run: |
+          pip install huggingface_hub hf-transfer -q
+          cat > /tmp/dl_models.py << 'PYEOF'
+          import os, sys
+          from huggingface_hub import snapshot_download
+          token = os.environ.get("HF_TOKEN")
+          ignore = ["*.msgpack", "flax_model*", "tf_model*"]
+          print("正在下载 CLIP 模型...")
+          snapshot_download("flavour/CLIP-ViT-B-16-DataComp.XL-s13B-b90K", token=token, ignore_patterns=ignore)
+          print("正在下载 CLIPSeg 模型...")
+          snapshot_download("CIDAS/clipseg-rd64-refined", token=token, ignore_patterns=ignore)
+          print("正在下载 YOLO 模型...")
+          import urllib.request
+          yolo_dir = os.path.expanduser("~/.cache/ultralytics")
+          os.makedirs(yolo_dir, exist_ok=True)
+          yolo_path = os.path.join(yolo_dir, "yolov8m-seg.pt")
+          if not os.path.exists(yolo_path):
+              urllib.request.urlretrieve("https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8m-seg.pt", yolo_path)
+              print("YOLO 模型下载完成")
+          else:
+              print("YOLO 模型已缓存，跳过下载")
+          print("正在下载 DannyLuna reCAPTCHA 模型...")
+          from huggingface_hub import hf_hub_download
+          import shutil, os
+          danny_cache = os.path.expanduser("~/.cache/dannyluna_recaptcha")
+          os.makedirs(danny_cache, exist_ok=True)
+          danny_dest = os.path.join(danny_cache, "recaptcha_classification_57k.onnx")
+          if not os.path.exists(danny_dest):
+              downloaded = hf_hub_download(
+                  repo_id="DannyLuna/recaptcha-classification-57k",
+                  filename="recaptcha_classification_57k.onnx",
+                  token=token,
+              )
+              shutil.copy2(downloaded, danny_dest)
+              print("DannyLuna 模型下载完成")
+          else:
+              print("DannyLuna 模型已缓存，跳过下载")
+          print("所有模型下载完成")
+          PYEOF
+          python /tmp/dl_models.py
+
+      - name: 验证缓存命中后环境完整性
+        if: steps.cache-pip.outputs.cache-hit == 'true'
+        run: |
+          echo "✅ pip 缓存命中，跳过安装"
+          python -c "import hcaptcha_challenger.agents; print('✅ hcaptcha_challenger.agents OK')" || echo "⚠️ 缓存失效，请手动触发一次 workflow 重建缓存"
+          # 把缓存里的 yolov8m-seg.pt 软链到工作目录，防止 botright/ultralytics 重新下载
+          ln -sf ~/.cache/ultralytics/yolov8m-seg.pt ./yolov8m-seg.pt || true
+          HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -c "import botright; print('✅ botright OK')" || true
+
+      - name: 下载并启动 Xray 代理
+        env:
+          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+        run: |
+          curl -sL https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-linux-64.zip -o /tmp/xray.zip
+          unzip /tmp/xray.zip xray geosite.dat geoip.dat -d /tmp/xray-bin
+          chmod +x /tmp/xray-bin/xray
+          echo "$V2RAY_CONFIG" > config.json
+          /tmp/xray-bin/xray run -c config.json &
+          sleep 5
+          echo "直连 IP："
+          curl -s --max-time 5 ifconfig.me || echo "(获取失败)"
+          echo ""
+          echo "代理 IP："
+          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me || echo "(获取失败)"
+          echo ""
+
+      - name: 启动 Xvfb 虚拟显示
+        run: |
+          Xvfb :99 -screen 0 1280x960x24 +extension RANDR &
+          echo $! > /tmp/xvfb.pid
+          sleep 2
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          echo "✅ Xvfb 已启动 (PID=$(cat /tmp/xvfb.pid))"
+
+      - name: 启动录屏（可选）
+        if: ${{ github.event.inputs.enable_recording == 'true' }}
+        run: |
+          ffmpeg -f x11grab -video_size 1280x960 -framerate 15 -i :99 \
+            -codec:v libx264 -preset ultrafast -crf 28 \
+            -pix_fmt yuv420p -movflags +faststart /tmp/recording.mp4 \
+            > /tmp/ffmpeg.log 2>&1 &
+          echo $! > /tmp/ffmpeg.pid
+          sleep 2
+          echo "📹 录屏已启动 (PID=$(cat /tmp/ffmpeg.pid))"
+
+      - name: 运行续期脚本
+        env:
+          RENEW_TOKEN_1: ${{ secrets.RENEW_TOKEN_1 }}
+          RENEW_TOKEN_2: ${{ secrets.RENEW_TOKEN_2 }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_OFFLINE: "1"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          GALLIUM_DRIVER: "llvmpipe"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          echo "🚀 续期脚本启动中，当前时间: $(date)"
+          timeout 360 python renew_host2play.py || echo "脚本退出码: $?"
+          echo "=== 截图目录内容 ==="
+          ls -la ./screenshots/ || echo "截图目录不存在"
+
+      - name: 停止录屏和 Xvfb
+        if: always()
+        run: |
+          if [ -f /tmp/ffmpeg.pid ]; then
+            kill $(cat /tmp/ffmpeg.pid) 2>/dev/null || true
+            sleep 2
+            VIDEO_SIZE=$(stat -c%s /tmp/recording.mp4 2>/dev/null || echo 0)
+            echo "录像文件大小: ${VIDEO_SIZE} bytes"
+          else
+            echo "📹 未启用录屏，跳过"
+          fi
+          [ -f /tmp/xvfb.pid ] && kill $(cat /tmp/xvfb.pid) 2>/dev/null || true
+
+      - name: 上传截图（及录屏）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_number }}
+          path: |
+            ./screenshots/*.png
+            /tmp/recording.mp4
+            /tmp/ffmpeg.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 清理旧 Workflow Run（只保留最新 2 个）
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: { workflow_runs } } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'renew.yml',
+              per_page: 100,
+            });
+            const runs = workflow_runs
+              .filter(r => r.id !== context.runId)
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const toDelete = runs.slice(1);
+            for (const r of toDelete) {
+              core.info(`删除旧 run: #${r.run_number} (id=${r.id}, created=${r.created_at})`);
+              await github.rest.actions.deleteWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: r.id,
+              });
+            }
+            core.info(`保留 ${Math.min(runs.length, 1) + 1} 个 run，删除 ${toDelete.length} 个`);
