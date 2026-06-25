@@ -2002,41 +2002,34 @@ async def solve_recaptcha(page) -> bool:
                             _last_checked_count = 0
                             _checked_stable_since = asyncio.get_event_loop().time()
                     elif status == "4x4":
-                        # ★ 4×4 先观察 Botright 是否在动（格子数增加），在动就放手不干预
+                        # ★ 4×4 观察 Botright 是否在动（格子数变化），在动就放手不干预
                         # 问题：table-44 class 做题期间一直存在，每轮都返回 4x4
-                        # 导致脚本反复点 reload 打断 Botright 正在进行的选择
-                        # ★ Fix2：reset 后 DOM 可能残留旧的 table-44，12s 冷却内不做 reload
+                        # ★ Fix2：reset 后 DOM 可能残留旧的 table-44，12s 冷却内不做判定
+                        # ★ Fix3：不再用 CDP 模拟点击 reload 按钮——这会跟 Botright/recognizer
+                        # 内部正在进行的操作（提交答案、重新检测tile等）产生竞态冲突，
+                        # 实测会把整个挑战打回未勾选 checkbox 并被 Google 判定 expired，
+                        # 而 Botright 的 solve_task 还在死等已经不存在的旧 DOM，反而卡死到 300s 超时。
+                        # 改为跟 3×3 一致的"长时间无变化才整体重开"策略，不再戳同一个 iframe。
                         _elapsed_since_start = asyncio.get_event_loop().time() - _attempt_start_time
                         if _elapsed_since_start < 12:
                             log.info(f"  [尝试{attempt_no}] 📐 4×4 检测（已运行{_elapsed_since_start:.0f}s），可能是 reset 后 DOM 残留，冷却等待...")
                             await asyncio.sleep(3)
                         else:
-                            _4x4_prev = await _count_checked_tiles()
-                            await asyncio.sleep(2)
-                            _4x4_cur = await _count_checked_tiles()
-                            if _4x4_cur != _4x4_prev:
-                                # Botright 在动，放手
-                                log.info(f"  [尝试{attempt_no}] 📐 4×4 Botright选格中（{_4x4_prev}→{_4x4_cur}），不干预")
+                            if last_status != "4x4":
+                                _do_botright_attempt._4x4_since = now
+                                _do_botright_attempt._4x4_last_count = await _count_checked_tiles()
                             else:
-                                # Botright 没动，才考虑 reload
-                                _4x4_reloads = getattr(_do_botright_attempt, '_4x4_reloads', 0)
-                                if _4x4_reloads < 3:
-                                    if await _cdp_click_in_bframe(page, "#recaptcha-reload-button"):
-                                        _do_botright_attempt._4x4_reloads = _4x4_reloads + 1
-                                        log.warning(f"  [尝试{attempt_no}] 📐 4×4 Botright未动，reload换题（CDP，第{_4x4_reloads+1}/3次）...")
-                                        await asyncio.sleep(1.5)
-                                    else:
-                                        log.warning(f"  [尝试{attempt_no}] 📐 4×4 reload失败，fallback reset")
-                                        solve_task.cancel()
-                                        bad_challenge = True
-                                    if bad_challenge:
-                                        break
-                                else:
-                                    log.warning(f"  [尝试{attempt_no}] 📐 4×4 已换题3次仍未出3×3，reset 重开")
-                                    _do_botright_attempt._4x4_reloads = 0
+                                _4x4_cur_count = await _count_checked_tiles()
+                                if _4x4_cur_count != getattr(_do_botright_attempt, '_4x4_last_count', _4x4_cur_count):
+                                    log.info(f"  [尝试{attempt_no}] 📐 4×4 Botright选格中（{getattr(_do_botright_attempt, '_4x4_last_count', _4x4_cur_count)}→{_4x4_cur_count}），不干预")
+                                    _do_botright_attempt._4x4_last_count = _4x4_cur_count
+                                    _do_botright_attempt._4x4_since = now
+                                elif now - getattr(_do_botright_attempt, '_4x4_since', now) > 60:
+                                    log.warning(f"  [尝试{attempt_no}] ⚠️ 4×4 状态 60s 无进展，Botright 卡死，整体 reset 重开（不再单独点 reload）")
                                     solve_task.cancel()
                                     bad_challenge = True
                                     break
+                            await asyncio.sleep(2)
                     elif status == "3x3":
                         log.info(f"  [尝试{attempt_no}] 🎯 3×3 动态挑战进行中...")
                         # ★ 修复：记录 3x3 状态开始时间，如果格子数长时间不变则判定 Botright 卡死
