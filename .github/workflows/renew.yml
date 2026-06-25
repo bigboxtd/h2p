@@ -215,7 +215,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           echo "🚀 续期脚本启动中，当前时间: $(date)"
-          timeout 720 python renew_host2play.py || echo "脚本退出码: $?"
+          timeout 1500 python renew_host2play.py || echo "脚本退出码: $?"
           echo "=== 截图目录内容 ==="
           ls -la ./screenshots/ || echo "截图目录不存在"
 
