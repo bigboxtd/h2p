@@ -1084,6 +1084,26 @@ async def solve_recaptcha(page) -> bool:
          ※ hl=en 已由 add_init_script 在 iframe 创建时注入，无需事后重载
       3. 直接交给 Botright page.solve_recaptcha() 全程接管（已移除手动点 checkbox 路径）
     """
+    # ★ 注册 reCAPTCHA 网络活动监听器（只注册一次，page级别去重）
+    # 原理：recognizer 每次"换题"(reload)或"提交答案"(userverify)都会真实
+    # 打一次 Google 接口，这是 Botright 在认真干活的客观证据，比"格子数量是否
+    # 变化"这种 DOM 层面的弱信号更可靠（4×4一次性识别+提交，绝大部分时间
+    # 格子数本来就不变，不能靠它判断是否卡死）
+    if not hasattr(page, "_recaptcha_activity"):
+        page._recaptcha_activity = {"last_ts": asyncio.get_event_loop().time()}
+
+        def _on_recaptcha_request(request):
+            try:
+                url = request.url
+                if ("google.com" in url or "recaptcha.net" in url) and (
+                    "reload" in url or "userverify" in url
+                ):
+                    page._recaptcha_activity["last_ts"] = asyncio.get_event_loop().time()
+            except Exception:
+                pass
+
+        page.on("request", _on_recaptcha_request)
+
     # 步骤1：确认 GDPR 已消失
     log.info("solve_recaptcha: 确认 GDPR 弹窗已消失...")
     if not await wait_gdpr_gone(page, timeout=5):
@@ -2020,12 +2040,18 @@ async def solve_recaptcha(page) -> bool:
                                 _do_botright_attempt._4x4_last_count = await _count_checked_tiles()
                             else:
                                 _4x4_cur_count = await _count_checked_tiles()
-                                if _4x4_cur_count != getattr(_do_botright_attempt, '_4x4_last_count', _4x4_cur_count):
-                                    log.info(f"  [尝试{attempt_no}] 📐 4×4 Botright选格中（{getattr(_do_botright_attempt, '_4x4_last_count', _4x4_cur_count)}→{_4x4_cur_count}），不干预")
+                                _4x4_prev_count = getattr(_do_botright_attempt, '_4x4_last_count', _4x4_cur_count)
+                                _net_last_ts = page._recaptcha_activity["last_ts"]
+                                _net_idle = now - _net_last_ts
+                                if _4x4_cur_count != _4x4_prev_count or _net_idle < 60:
+                                    if _4x4_cur_count != _4x4_prev_count:
+                                        log.info(f"  [尝试{attempt_no}] 📐 4×4 Botright选格中（{_4x4_prev_count}→{_4x4_cur_count}），不干预")
+                                    elif _net_idle < 60:
+                                        log.debug(f"  [尝试{attempt_no}] 📐 4×4 格子数未变，但{_net_idle:.0f}s前有reload/userverify请求，仍在工作")
                                     _do_botright_attempt._4x4_last_count = _4x4_cur_count
                                     _do_botright_attempt._4x4_since = now
                                 elif now - getattr(_do_botright_attempt, '_4x4_since', now) > 60:
-                                    log.warning(f"  [尝试{attempt_no}] ⚠️ 4×4 状态 60s 无进展，Botright 卡死，整体 reset 重开（不再单独点 reload）")
+                                    log.warning(f"  [尝试{attempt_no}] ⚠️ 4×4 状态 60s 无进展（格子数不变 且 {_net_idle:.0f}s 内无 reload/userverify 请求），Botright 真卡死，整体 reset 重开")
                                     solve_task.cancel()
                                     bad_challenge = True
                                     break
