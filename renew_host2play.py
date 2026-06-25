@@ -1608,7 +1608,7 @@ async def solve_recaptcha(page) -> bool:
                 import random as _random
 
                 _loop_round = 0
-                _max_loops = 4  # 最多循环4轮防止死循环（动态3×3每轮最多刷2格，4轮足够）
+                _max_loops = 2  # ★ 从4改为2：补选轮次太多会让Google判定session异常导致挑战框消失
                 # ★ 修复：不再用 set 跨轮次去重。
                 # 旧逻辑用坐标 set，导致格子刷新后出现的新目标图被永远跳过。
                 # 正确做法：用计数器记录每个坐标被点击的次数，
@@ -2126,11 +2126,57 @@ async def solve_recaptcha(page) -> bool:
             log.warning("  [solve_recaptcha] ⚠️ Vignette 导致页面重置，需要重新点击 Renew server")
             return "VIGNETTE_RESET"
         if attempt < MAX_CAPTCHA_ATTEMPTS:
-            # ★ 延长重试间隔：连续快速重试会让 Google 持续加重挑战难度
-            # 随机等待让 Google 评分有机会降低，提高下次 checkbox 直接通过概率
-            _wait = random.uniform(5, 10)
-            log.info(f"  尝试{attempt}失败，等待{_wait:.0f}s后重试...")
+            # ★ 关键修复：失败后做页面级 reload，而不是只 sleep
+            # 原因：AssertionError "Challenge is not visible" 说明 Google 已把整个挑战框关掉
+            # 这时 grecaptcha.reset() 救不了——bframe 已经不存在，reset 只重置 checkbox 逻辑状态
+            # 必须重新加载整个页面 → 重走 GDPR 关闭 → 重新点 Renew server → 等 swal2 弹窗
+            # 才能得到一个干净的新 bframe 让下次 attempt 正常开始
+            _wait = random.uniform(3, 5)
+            log.info(f"  尝试{attempt}失败，等待{_wait:.0f}s后重新加载页面...")
             await asyncio.sleep(_wait)
+            try:
+                log.info(f"  [重试前] 重新导航到续期页面，获取干净的 reCAPTCHA session...")
+                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(2)
+                await close_gdpr_consent(page)
+                await wait_gdpr_gone(page, timeout=10)
+                await close_ads(page)
+                # 重新点击 Renew server 触发 swal2 弹窗
+                _re_clicked = False
+                for _rs in ["button.btn-primary", "button:has-text('Renew server')", ".btn:has-text('Renew server')"]:
+                    try:
+                        _rb = page.locator(_rs).first
+                        if await _rb.is_visible(timeout=3000):
+                            _rbox = await _rb.bounding_box(timeout=5000)
+                            if _rbox:
+                                await page.mouse.click(
+                                    _rbox["x"] + _rbox["width"] / 2,
+                                    _rbox["y"] + _rbox["height"] / 2
+                                )
+                                log.info(f"  [重试前] ✅ 重新点击 Renew server ({_rs})")
+                                _re_clicked = True
+                                break
+                    except Exception as _rce:
+                        log.debug(f"  [重试前] {_rs} 失败: {_rce}")
+                if not _re_clicked:
+                    log.warning("  [重试前] ⚠️ 找不到 Renew server 按钮，下次 attempt 可能直接失败")
+                else:
+                    # 等 swal2 弹窗和 reCAPTCHA iframe 重新出现
+                    for _wi in range(15):
+                        try:
+                            if await page.locator(".swal2-container").is_visible(timeout=500):
+                                log.info(f"  [重试前] ✅ swal2 弹窗已重新出现（{_wi}s）")
+                                break
+                        except:
+                            pass
+                        await asyncio.sleep(1)
+                    await close_gdpr_consent(page)
+                    await wait_gdpr_gone(page, timeout=5)
+                    await close_ads(page)
+                    await asyncio.sleep(2)
+                    log.info("  [重试前] 页面已重置，下次 attempt 从干净状态开始")
+            except Exception as _reload_e:
+                log.warning(f"  [重试前] 页面重置失败（{_reload_e}），继续重试（可能失败）")
 
     log.error(f"❌ 路径2 全部 {MAX_CAPTCHA_ATTEMPTS} 次尝试均失败")
     if await is_recaptcha_solved(page):
