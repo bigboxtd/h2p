@@ -1844,15 +1844,15 @@ async def solve_recaptcha(page) -> bool:
             except Exception as _rt_e:
                 log.debug(f"  [尝试{attempt_no}] 设置 retry_times 失败（不影响主流程）: {_rt_e}")
 
-            log.info(f"  [尝试{attempt_no}] 调用 page.solve_recaptcha()（300s超时）...")
+            log.info(f"  [尝试{attempt_no}] 调用 page.solve_recaptcha()（500s超时）...")
 
             solve_task = asyncio.create_task(page.solve_recaptcha())
             bad_challenge = False
             _do_botright_attempt._4x4_reloads = 0  # 每次新attempt重置4×4换题计数
             # ★ 修复：从90s延长到150s，因为try_again后Botright需要继续做第二轮图片挑战
             # 第一轮约50s + try_again等待约5s + 第二轮约50s = 约105s，90s根本不够
-            # ★ 再延长到300s：retry_times调大后单次attempt内部重试更多轮，需要更多时间窗口
-            deadline = asyncio.get_event_loop().time() + 300
+            # ★ 再延长到500s：retry_times调大后单次attempt内部重试更多轮，实测5轮try_again约210s，需要足够窗口
+            deadline = asyncio.get_event_loop().time() + 500
             _attempt_start_time = asyncio.get_event_loop().time()  # ★ Fix2：记录attempt开始时间
             last_status = ""
             _last_checked_count = 0
@@ -1864,7 +1864,7 @@ async def solve_recaptcha(page) -> bool:
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
                     solve_task.cancel()
-                    log.warning(f"  [尝试{attempt_no}] ⏰ 300s 超时，reset 重新开局")
+                    log.warning(f"  [尝试{attempt_no}] ⏰ 500s 超时，reset 重新开局")
                     bad_challenge = True
                     break
 
