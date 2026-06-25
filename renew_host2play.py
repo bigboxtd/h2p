@@ -1076,7 +1076,7 @@ async def _wait_anchor_stable(page, label="", timeout=20) -> bool:
     return False
 
 
-async def solve_recaptcha(page) -> bool:
+async def solve_recaptcha(page, url: str = "") -> bool:
     """
     reCAPTCHA 解决策略：
       1. 确认 GDPR 弹窗已消失
@@ -2591,7 +2591,7 @@ async def renew_server(page, url: str, server_label: str) -> tuple[bool, str | N
 
         log.info("步骤2：处理 reCAPTCHA（代理IP普通模式优先，图片挑战用 recognizer）...")
         log.info(f"[renew_server] 开始 reCAPTCHA 处理...")
-        _captcha_result = await solve_recaptcha(page)
+        _captcha_result = await solve_recaptcha(page, url)
         if _captcha_result == "VIGNETTE_RESET":
             log.warning(f"  [renew_server] ⚠️ solve_recaptcha 返回 VIGNETTE_RESET（第{_vignette_round+1}次），重新走步骤1...")
             continue
