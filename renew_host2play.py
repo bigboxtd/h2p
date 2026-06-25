@@ -1491,6 +1491,7 @@ async def solve_recaptcha(page) -> bool:
                         log.warning(f"  [补选{attempt_no}] DannyLuna 模型缓存不存在: {_danny_model_path}，应在 workflow 预下载步骤中下载")
                         raise FileNotFoundError(f"DannyLuna 模型未预缓存: {_danny_model_path}")
                     _danny_model = _YOLO(_danny_model_path, task="classify")
+                    log.info(f"  [补选{attempt_no}] DannyLuna 模型已加载（后续各轮复用）")
 
                     # ★ 官方 TARGET_MAPPINGS（与 types.py 完全同步，class index 与模型一致）
                     _danny_target_map = {
@@ -1651,11 +1652,11 @@ async def solve_recaptcha(page) -> bool:
                     await asyncio.sleep(2.0)
 
                     # ★ 等待动态格子加载完毕（防止截图截到空白/半加载格子）
-                    for _wi2 in range(20):  # 最多再等 10s
+                    for _wi2 in range(6):  # 最多再等 3s（图片通常1s内完成加载）
                         if not await _has_loading_tiles():
                             break
                         await asyncio.sleep(0.5)
-                    await asyncio.sleep(0.3)  # 格子稳定后极短等待（Chromium截图前已完成composite）
+                    await asyncio.sleep(0.2)  # 格子稳定后极短等待（Chromium截图前已完成composite）
 
                     # ★ 重新截图 + 重新识别，找新刷出的目标格子
                     _hit_indices = []
@@ -1728,9 +1729,9 @@ async def solve_recaptcha(page) -> bool:
                                     try: _os.unlink(_p2)
                                     except: pass
                             log.info(f"  [补选{attempt_no}] 第{_loop_round}轮DannyLuna识别完成，新命中 {len(_hit_indices)} 格: {_hit_indices}")
-                        # ★ 每轮都用Detector兜底补漏，取并集
+                        # ★ 每轮都用Detector兜底补漏，取并集（复用已初始化的_det实例，不重复加载）
                         try:
-                            _det2 = _Detector()
+                            _det2 = _det  # ★ 复用外层已初始化的Detector，避免每轮重新加载CLIP模型
                             _det_resp2, _ = _det2.detect(prompt_text, _new_tile_images, area_captcha=is_4x4)
                             _det2_indices = [
                                 _i2 for _i2, _h2 in enumerate(_det_resp2)
@@ -1756,11 +1757,11 @@ async def solve_recaptcha(page) -> bool:
                 # ★ VERIFY 前等动态图刷新完毕，再做 recognizer 全量复查
                 # 循环最后一轮点完后图片还在刷新，必须等稳定后截图才准确
                 log.info(f"  [补选{attempt_no}] 等待最后一轮图片刷新稳定...")
-                for _wi in range(20):  # 最多等 10s
+                for _wi in range(6):  # 最多等 3s
                     if not await _has_loading_tiles():
                         break
                     await asyncio.sleep(0.5)
-                await asyncio.sleep(0.8)  # 额外等渲染完成（图片decode需要时间）
+                await asyncio.sleep(0.5)  # 额外等渲染完成
                 log.info(f"  [补选{attempt_no}] 图片已稳定，开始 recognizer 全量复查...")
 
                 # ★ VERIFY 前用 recognizer 全量过一遍，补漏 DannyLuna 没识别到的格子
@@ -1789,7 +1790,7 @@ async def solve_recaptcha(page) -> bool:
                             _final_tile_images.append(_tbf.tobytes())
 
                     # recognizer 全量识别
-                    _det_final = _Detector()
+                    _det_final = _det  # ★ 复用外层已初始化的Detector，避免重复加载CLIP模型
                     _det_final_resp, _ = _det_final.detect(prompt_text, _final_tile_images, area_captcha=is_4x4)
 
                     # 筛出：recognizer 认为命中 且 点击次数未达上限的格子
@@ -2055,7 +2056,7 @@ async def solve_recaptcha(page) -> bool:
                                     solve_task.cancel()
                                     bad_challenge = True
                                     break
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(1)  # ★ 从2s缩短到1s，更快响应状态变化
                     elif status == "3x3":
                         log.info(f"  [尝试{attempt_no}] 🎯 3×3 动态挑战进行中...")
                         # ★ 修复：记录 3x3 状态开始时间，如果格子数长时间不变则判定 Botright 卡死
