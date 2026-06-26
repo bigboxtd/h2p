@@ -317,25 +317,6 @@ async def close_ads(page):
                     removed++;
                 }
             }
-            // ★ 新增：通用兜底——按"贴底悬浮条"几何特征识别外链视频广告（NetShort/Connatix等），
-            // 不依赖具体 class/id（广告供应商会随机化命名），只看：
-            // fixed/sticky 定位 + 紧贴视口底部 + 横向占据视口一半以上宽度 + 高度明显（>60px）
-            const allTop = document.querySelectorAll('body *');
-            for (const el of allTop) {
-                if (isProtected(el)) continue;
-                const style = window.getComputedStyle(el);
-                const pos = style.position;
-                if (pos !== 'fixed' && pos !== 'sticky') continue;
-                const rect = el.getBoundingClientRect();
-                if (rect.width < window.innerWidth * 0.5) continue;
-                if (rect.height < 60 || rect.height > window.innerHeight * 0.6) continue;
-                // 紧贴底部（容差 10px）
-                if (Math.abs(rect.bottom - window.innerHeight) > 10) continue;
-                if (rect.top < window.innerHeight * 0.3) continue; // 排除占满全屏的弹窗
-                removed_els.push('[bottom-sticky]' + el.tagName + (el.id ? '#'+el.id : '') + (el.className && typeof el.className === 'string' ? '.'+el.className.trim().split(/[\s]+/).join('.') : ''));
-                el.remove();
-                removed++;
-            }
             // 把删了哪些元素也返回出来，方便调试
             return {count: removed, els: removed_els.slice(0, 20)};
         }""")
@@ -1497,14 +1478,36 @@ async def solve_recaptcha(page, url: str = "") -> bool:
                         _last_checked_count = 0
                         _checked_stable_since = asyncio.get_event_loop().time()
                     elif status == "select_all":
-                        # select_all = 漏选格子，直接 reload 换题
-                        log.warning(f"  [尝试{attempt_no}] ⚠️ 'Please select all matching' — 直接 reload 换题")
-                        if await _cdp_click_in_bframe(page, "#recaptcha-reload-button"):
-                            log.info(f"  [尝试{attempt_no}] ✅ reload换题完成（CDP），等Botright识别新题...")
+                        # select_all = 漏选格子
+                        # ★ 策略：先让 recognizer 扫描当前题目，把漏选的格子补上再提交
+                        # 只有当前已选格子为0（完全空白）时才直接 reload 换题
+                        log.warning(f"  [尝试{attempt_no}] ⚠️ 'Please select all matching' — 先尝试补选后提交")
+                        _cur_checked = await _count_checked_tiles()
+                        if _cur_checked > 0:
+                            # 已有部分格子被选，让 Botright 自己再补一轮（等2s观察）
+                            log.info(f"  [尝试{attempt_no}] 当前已选 {_cur_checked} 格，等2s观察Botright是否补选...")
+                            await asyncio.sleep(2)
+                            _after_checked = await _count_checked_tiles()
+                            if _after_checked != _cur_checked:
+                                # Botright 在动，不干预，重置稳定计时
+                                log.info(f"  [尝试{attempt_no}] Botright在补选（{_cur_checked}→{_after_checked}格），交给它继续...")
+                                _last_checked_count = _after_checked
+                                _checked_stable_since = asyncio.get_event_loop().time()
+                            else:
+                                # Botright 没动，主动点一次 VERIFY 再看结果
+                                log.info(f"  [尝试{attempt_no}] Botright未动，主动点 VERIFY 尝试提交（已选{_after_checked}格）...")
+                                await _click_verify_button()
+                                _last_checked_count = _after_checked
+                                _checked_stable_since = asyncio.get_event_loop().time()
                         else:
-                            log.warning(f"  [尝试{attempt_no}] reload按钮不可见或CDP失败")
-                        _last_checked_count = 0
-                        _checked_stable_since = asyncio.get_event_loop().time()
+                            # 完全没有格子被选，直接 reload 换题
+                            log.warning(f"  [尝试{attempt_no}] 当前已选0格，直接 reload 换题")
+                            if await _cdp_click_in_bframe(page, "#recaptcha-reload-button"):
+                                log.info(f"  [尝试{attempt_no}] ✅ reload换题完成（CDP），等Botright识别新题...")
+                            else:
+                                log.warning(f"  [尝试{attempt_no}] reload按钮不可见或CDP失败")
+                            _last_checked_count = 0
+                            _checked_stable_since = asyncio.get_event_loop().time()
                     elif status == "check_new":
                         # check_new = 动态3×3有新图刷入，Botright卡死没继续选
                         # 先等1s看Botright是否自己动，不动就用Detector补选新格子
@@ -1651,19 +1654,6 @@ async def solve_recaptcha(page, url: str = "") -> bool:
                     try:
                         _rb = page.locator(_rs).first
                         if await _rb.is_visible(timeout=3000):
-                            # ★ 修复：底部贴边视频广告可能正好遮住按钮原位置，
-                            # 一次性 JS scrollIntoView（不用 Playwright 的轮询稳定性检测，
-                            # 避免倒计时 DOM 每秒刷新导致 actionability 检查卡死），
-                            # 然后再清一次广告，最后用滚动后的最新坐标点击。
-                            try:
-                                await page.evaluate(
-                                    "(el) => el.scrollIntoView({block: 'center', inline: 'center'})",
-                                    await _rb.element_handle()
-                                )
-                                await asyncio.sleep(0.3)
-                            except Exception:
-                                pass
-                            await close_ads(page)
                             _rbox = await _rb.bounding_box(timeout=5000)
                             if _rbox:
                                 await page.mouse.click(
@@ -2059,25 +2049,39 @@ async def renew_server(page, url: str, server_label: str) -> tuple[bool, str | N
             if not await wait_gdpr_gone(page, timeout=10):
                 await close_gdpr_consent(page)
                 await asyncio.sleep(2)
-            await close_ads(page)
+            # ★ goto fallback 后页面需要重新加载，Renew server 按钮最多需要 ~15-20s 才出现
+            # 改为轮询等待，每秒检测一次，最多等 25s
             _re_clicked = False
-            for _rs in ["button.btn-primary", "button:has-text('Renew server')", ".btn:has-text('Renew server')"]:
-                try:
-                    _rb = page.locator(_rs).first
-                    if await _rb.is_visible(timeout=3000):
-                        _rbox = await _rb.bounding_box(timeout=5000)
-                        if _rbox:
-                            await page.mouse.click(
-                                _rbox["x"] + _rbox["width"] / 2,
-                                _rbox["y"] + _rbox["height"] / 2
-                            )
-                            log.info(f"  [Vignette重试] ✅ 重新点击 '{_rs}'")
-                            _re_clicked = True
-                            break
-                except Exception as _re:
-                    log.debug(f"  [Vignette重试] 选择器 {_rs} 失败: {_re}")
+            _renew_btn_selectors = ["button.btn-primary", "button:has-text('Renew server')", ".btn:has-text('Renew server')"]
+            log.info(f"  [Vignette重试] 等待 Renew server 按钮出现（最多25s）...")
+            for _wait_i in range(25):
+                # 每5s清一次广告（防止遮挡）
+                if _wait_i > 0 and _wait_i % 5 == 0:
+                    await close_ads(page)
+                _found_btn = False
+                for _rs in _renew_btn_selectors:
+                    try:
+                        _rb = page.locator(_rs).first
+                        if await _rb.is_visible(timeout=800):
+                            _rbox = await _rb.bounding_box(timeout=3000)
+                            if _rbox:
+                                await page.mouse.click(
+                                    _rbox["x"] + _rbox["width"] / 2,
+                                    _rbox["y"] + _rbox["height"] / 2
+                                )
+                                log.info(f"  [Vignette重试] ✅ 重新点击 '{_rs}'（等待了{_wait_i}s）")
+                                _re_clicked = True
+                                _found_btn = True
+                                break
+                    except Exception as _re:
+                        log.debug(f"  [Vignette重试] 选择器 {_rs} 失败: {_re}")
+                if _found_btn:
+                    break
+                if _wait_i < 24:
+                    log.debug(f"  [Vignette重试] 按钮未出现（{_wait_i+1}s），继续等待...")
+                    await asyncio.sleep(1)
             if not _re_clicked:
-                log.error(f"  [Vignette重试] ❌ 找不到 Renew server 按钮，放弃")
+                log.error(f"  [Vignette重试] ❌ 等待25s后仍找不到 Renew server 按钮，放弃")
                 break
             # 等待 swal2 弹窗重新出现（最多 20s）
             _modal_re = False
