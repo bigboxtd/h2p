@@ -1859,6 +1859,15 @@ async def solve_recaptcha(page, url: str = "") -> bool:
             _checked_stable_since = 0.0
             _last_auto_verify_time = 0.0
             _redetect_count = 0  # 同一道题连续补选次数，超过1次强制换题避免死循环
+            # ★ 新增：全局无进展看门狗。status 检测在 DOM 异常（如图片0张/socket hang up
+            # 导致 recognizer 网络拦截失败）时可能在 "3x3"/"unknown" 之间反复跳变，
+            # 使依赖"连续两次status相同"的局部watchdog永远不触发，只能干等到500s硬超时。
+            # 这里不看 status 是否稳定，只看"checked_count 或 status 有没有发生过任何变化"，
+            # 90s 内完全没有任何变化 → 判定整个挑战已死锁，直接 page.reload() 强制刷新页面，
+            # 拿到全新的 DOM/iframe，而不是让 Botright 继续对着旧状态空转。
+            _global_progress_ts = asyncio.get_event_loop().time()
+            _global_last_status = ""
+            _global_last_count = -1
 
             while not solve_task.done():
                 remaining = deadline - asyncio.get_event_loop().time()
@@ -1933,6 +1942,27 @@ async def solve_recaptcha(page, url: str = "") -> bool:
 
                 # ★ 自动提交检测：格子已选 且 状态稳定超过8s 且 距上次自动提交超过15s
                 checked_count = await _count_checked_tiles()
+
+                # ★ 全局无进展看门狗（与下方依赖 status 连续相同的局部watchdog互补）
+                # 任何 status 变化 或 checked_count 变化都算"有进展"，重置计时
+                if status != _global_last_status or checked_count != _global_last_count:
+                    _global_progress_ts = now
+                    _global_last_status = status
+                    _global_last_count = checked_count
+                elif now - _global_progress_ts > 90:
+                    log.warning(
+                        f"  [尝试{attempt_no}] ⚠️ 90s 内 status/格子数完全无变化"
+                        f"（当前status={status!r}），疑似 socket hang up / DOM 残留导致死锁，"
+                        f"强制 page.reload() 拿干净DOM..."
+                    )
+                    solve_task.cancel()
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=20000)
+                    except Exception as _reload_e:
+                        log.warning(f"  [尝试{attempt_no}] page.reload() 失败: {_reload_e}")
+                    bad_challenge = True
+                    break
+
                 if checked_count > 0:
                     if checked_count != _last_checked_count:
                         # 格子数变化，重置稳定计时
