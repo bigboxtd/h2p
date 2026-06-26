@@ -317,6 +317,25 @@ async def close_ads(page):
                     removed++;
                 }
             }
+            // ★ 新增：通用兜底——按"贴底悬浮条"几何特征识别外链视频广告（NetShort/Connatix等），
+            // 不依赖具体 class/id（广告供应商会随机化命名），只看：
+            // fixed/sticky 定位 + 紧贴视口底部 + 横向占据视口一半以上宽度 + 高度明显（>60px）
+            const allTop = document.querySelectorAll('body *');
+            for (const el of allTop) {
+                if (isProtected(el)) continue;
+                const style = window.getComputedStyle(el);
+                const pos = style.position;
+                if (pos !== 'fixed' && pos !== 'sticky') continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < window.innerWidth * 0.5) continue;
+                if (rect.height < 60 || rect.height > window.innerHeight * 0.6) continue;
+                // 紧贴底部（容差 10px）
+                if (Math.abs(rect.bottom - window.innerHeight) > 10) continue;
+                if (rect.top < window.innerHeight * 0.3) continue; // 排除占满全屏的弹窗
+                removed_els.push('[bottom-sticky]' + el.tagName + (el.id ? '#'+el.id : '') + (el.className && typeof el.className === 'string' ? '.'+el.className.trim().split(/[\s]+/).join('.') : ''));
+                el.remove();
+                removed++;
+            }
             // 把删了哪些元素也返回出来，方便调试
             return {count: removed, els: removed_els.slice(0, 20)};
         }""")
@@ -1632,6 +1651,19 @@ async def solve_recaptcha(page, url: str = "") -> bool:
                     try:
                         _rb = page.locator(_rs).first
                         if await _rb.is_visible(timeout=3000):
+                            # ★ 修复：底部贴边视频广告可能正好遮住按钮原位置，
+                            # 一次性 JS scrollIntoView（不用 Playwright 的轮询稳定性检测，
+                            # 避免倒计时 DOM 每秒刷新导致 actionability 检查卡死），
+                            # 然后再清一次广告，最后用滚动后的最新坐标点击。
+                            try:
+                                await page.evaluate(
+                                    "(el) => el.scrollIntoView({block: 'center', inline: 'center'})",
+                                    await _rb.element_handle()
+                                )
+                                await asyncio.sleep(0.3)
+                            except Exception:
+                                pass
+                            await close_ads(page)
                             _rbox = await _rb.bounding_box(timeout=5000)
                             if _rbox:
                                 await page.mouse.click(
