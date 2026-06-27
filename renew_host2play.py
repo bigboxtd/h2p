@@ -1,4 +1,4 @@
-import os, logging, random, json, time, re, html, tempfile, base64, asyncio
+import os, sys, logging, random, json, time, re, html, tempfile, base64, asyncio
 from pathlib import Path
 from datetime import datetime
 
@@ -67,6 +67,86 @@ try:
     torch.set_default_dtype(torch.float32)
 
     logging.getLogger(__name__).info("✅ torch BFloat16 修复已启用（autocast noop + load cast + forward hook + default float32）")
+except ImportError:
+    pass
+
+# ★ 新增：monkeypatch recognizer 库的 handle_recaptcha
+# 原库逻辑：点 VERIFY 提交后，无论是 "Please also check new images"（还有新格子没选）
+# 还是 "Incorrect, try again"（答案选错），统统走 load_captcha(reset=True) → 点击
+# #recaptcha-reload-button 整题作废重开。但 check_new 的真实含义是"答案没错，只是
+# 动态题里又冒出几张新图没勾选"，正确做法应该是原地再跑一次 detect_tiles() 把新格子
+# 补上再提交一次，而不是把已经选对的进度全部扔掉重开一轮（reload还会跟外层脚本自己
+# 的"全局看门狗"竞态，导致 DOM 中途被两边同时操作，出现 images amount must equal 9
+# or 16. Is: 0 这种识图失败）。
+try:
+    from recognizer.agents.playwright.async_control import AsyncChallenger as _AsyncChallenger
+    from playwright.async_api import TimeoutError as _PWTimeoutError
+
+    async def _patched_handle_recaptcha(self):
+        if isinstance(loaded_captcha := await self.load_captcha(), str):
+            return loaded_captcha
+
+        captcha_frame = self.page.frame_locator("//iframe[contains(@src,'bframe')]")
+        label_obj = captcha_frame.locator("//strong")
+        if not (prompt := await label_obj.text_content()):
+            raise ValueError("reCaptcha Task Text did not load.")
+
+        for _ in range(30):
+            recaptcha_tiles = await captcha_frame.locator("[class='rc-imageselect-tile']").all()
+            tiles_visibility = [await tile.is_visible() for tile in recaptcha_tiles]
+            if len(recaptcha_tiles) in (9, 16) and len(tiles_visibility) in (9, 16):
+                break
+            await self.page.wait_for_timeout(1000)
+        else:
+            await self.load_captcha(captcha_frame, reset=True)
+            return await self.handle_recaptcha()
+
+        area_captcha = len(recaptcha_tiles) == 16
+        result_clicked = await self.detect_tiles(prompt, area_captcha)
+
+        if self.dynamic and not area_captcha:
+            while result_clicked:
+                await self.page.wait_for_timeout(5000)
+                result_clicked = await self.detect_tiles(prompt, area_captcha)
+        elif not result_clicked:
+            await self.load_captcha(captcha_frame, reset=True)
+            return await self.handle_recaptcha()
+
+        try:
+            submit_button = captcha_frame.locator("#recaptcha-verify-button")
+            await submit_button.click()
+        except _PWTimeoutError:
+            await self.load_captcha(captcha_frame, reset=True)
+            return await self.handle_recaptcha()
+
+        for _ in range(5):
+            if captcha_token := await self.check_result():
+                return captcha_token
+            await self.page.wait_for_timeout(1000)
+
+        # ★ 区分 check_new（漏选，需要补选）vs 真正 incorrect（选错，需要reset）
+        check_new_el = captcha_frame.locator(
+            ".rc-imageselect-error-dynamic-more, .rc-imageselect-error-select-more"
+        )
+        try:
+            is_check_new = await check_new_el.first.is_visible(timeout=500)
+        except Exception:
+            is_check_new = False
+
+        if is_check_new:
+            # 原地再做一轮识图补选新出现的格子，不reset、不丢已选进度
+            await self.detect_tiles(prompt, area_captcha)
+            return await self.handle_recaptcha()
+
+        incorrect = self.page.locator("[class='rc-imageselect-incorrect-response']")
+        errors = self.page.locator("[class *= 'rc-imageselect-error']")
+        if await incorrect.is_visible() or any([await error.is_visible() for error in await errors.all()]):
+            await self.load_captcha(captcha_frame, reset=True)
+
+        return await self.handle_recaptcha()
+
+    _AsyncChallenger.handle_recaptcha = _patched_handle_recaptcha
+    logging.getLogger(__name__).info("✅ recognizer.handle_recaptcha 已patch：check_new 改为原地补选，不再reset整题")
 except ImportError:
     pass
 
@@ -1337,6 +1417,28 @@ async def solve_recaptcha(page, url: str = "") -> bool:
 
             log.info(f"  [尝试{attempt_no}] 调用 page.solve_recaptcha()（500s超时）...")
 
+            # ★ 新增：快速熔断 —— 监听 stdout，捕获 recognizer 库打印的
+            # "[ERROR] Images amount must equal 9 or 16. Is: 0" 这条特征错误。
+            # 该错误通常出现在 DOM 中途被刷新/换题（比如手动reload按钮点击与
+            # Botright自身任务竞态）导致 recognizer 截图时拿到空白/残留页面，
+            # 此后只会反复刷同一条错误，原来要等90s全局看门狗才会强制reload，
+            # 现在只要短时间内连续出现2次就立刻提前触发reload，不用死等90秒。
+            class _ImgCountWatcher:
+                def __init__(self, real):
+                    self._real = real
+                    self.count = 0
+                    self.last_ts = 0.0
+                def write(self, s):
+                    self._real.write(s)
+                    if "Images amount must equal" in s:
+                        self.count += 1
+                        self.last_ts = asyncio.get_event_loop().time()
+                def flush(self):
+                    self._real.flush()
+            _img_watcher = _ImgCountWatcher(sys.stdout)
+            _old_stdout = sys.stdout
+            sys.stdout = _img_watcher
+
             solve_task = asyncio.create_task(page.solve_recaptcha())
             bad_challenge = False
             _do_botright_attempt._4x4_reloads = 0  # 每次新attempt重置4×4换题计数
@@ -1430,6 +1532,22 @@ async def solve_recaptcha(page, url: str = "") -> bool:
                 status = await _get_challenge_status()
                 now = asyncio.get_event_loop().time()
 
+                # ★ 快速熔断：3秒内连续命中2次 "Images amount must equal" 报错，
+                # 说明 recognizer 截图拿到的页面是残留/空白DOM，不用等90s全局看门狗，
+                # 立刻强制 page.reload() 拿干净DOM。
+                if _img_watcher.count >= 2 and (now - _img_watcher.last_ts) < 3:
+                    log.warning(
+                        f"  [尝试{attempt_no}] ⚡ 快速熔断：{_img_watcher.count}次 'Images amount "
+                        f"must equal' 报错（DOM残留/识图失败），立即 page.reload()..."
+                    )
+                    solve_task.cancel()
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=20000)
+                    except Exception as _reload_e:
+                        log.warning(f"  [尝试{attempt_no}] page.reload() 失败: {_reload_e}")
+                    bad_challenge = True
+                    break
+
                 # ★ 自动提交检测：格子已选 且 状态稳定超过8s 且 距上次自动提交超过15s
                 checked_count = await _count_checked_tiles()
 
@@ -1509,26 +1627,22 @@ async def solve_recaptcha(page, url: str = "") -> bool:
                             _last_checked_count = 0
                             _checked_stable_since = asyncio.get_event_loop().time()
                     elif status == "check_new":
-                        # check_new = 动态3×3有新图刷入，Botright卡死没继续选
-                        # 先等1s看Botright是否自己动，不动就用Detector补选新格子
-                        log.info(f"  [尝试{attempt_no}] 🔍 'Please also check new images' — 等1s观察Botright...")
+                        # ★ check_new 现已由 patch 过的 recognizer 自己原地补选处理
+                        # （见文件头部 _patched_handle_recaptcha），不再需要外层脚本手动
+                        # 用 CDP 点击 #recaptcha-reload-button 强制换题——那样做等于跟
+                        # recognizer 内部正在跑的 detect_tiles() 抢同一个DOM，是真正导致
+                        # "Images amount must equal 9 or 16. Is: 0" 的原因。这里只做纯观察，
+                        # 给 recognizer 留出时间完成一轮截图+识图+点击+再提交。
+                        log.info(f"  [尝试{attempt_no}] 🔍 'Please also check new images' — recognizer 正在原地补选，观察中...")
                         _prev_checked = await _count_checked_tiles()
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(3)
                         _cur = await _count_checked_tiles()
                         if _cur != _prev_checked:
-                            # Botright在动，不干预
-                            log.info(f"  [尝试{attempt_no}] Botright在补选（{_prev_checked}→{_cur}格），不干预")
-                            _last_checked_count = _cur
-                            _checked_stable_since = asyncio.get_event_loop().time()
+                            log.info(f"  [尝试{attempt_no}] recognizer 补选中（{_prev_checked}→{_cur}格），不干预")
                         else:
-                            # Botright卡死，直接 reload 换题
-                            log.warning(f"  [尝试{attempt_no}] check_new Botright未动，直接 reload 换题...")
-                            if await _cdp_click_in_bframe(page, "#recaptcha-reload-button"):
-                                log.info(f"  [尝试{attempt_no}] ✅ reload换题完成（CDP）")
-                            else:
-                                log.warning(f"  [尝试{attempt_no}] reload按钮不可见或CDP失败")
-                            _last_checked_count = 0
-                            _checked_stable_since = asyncio.get_event_loop().time()
+                            log.info(f"  [尝试{attempt_no}] 格子数未变，继续交给 recognizer 内部流程处理，不主动reload")
+                        _last_checked_count = _cur
+                        _checked_stable_since = asyncio.get_event_loop().time()
                     elif status == "4x4":
                         # ★ 4×4 观察 Botright 是否在动（格子数变化），在动就放手不干预
                         # 问题：table-44 class 做题期间一直存在，每轮都返回 4x4
@@ -1588,6 +1702,8 @@ async def solve_recaptcha(page, url: str = "") -> bool:
                 except asyncio.TimeoutError:
                     pass
 
+            sys.stdout = _old_stdout  # ★ 恢复 stdout，监控器只在本次 attempt 内生效
+
             if bad_challenge:
                 try:
                     await solve_task
@@ -1603,13 +1719,25 @@ async def solve_recaptcha(page, url: str = "") -> bool:
             result = solve_task.result() if not solve_task.cancelled() else False
             log.info(f"  [尝试{attempt_no}] Botright 返回: {result}")
         except asyncio.CancelledError:
+            try:
+                sys.stdout = _old_stdout
+            except NameError:
+                pass
             log.warning(f"  [尝试{attempt_no}] solve_recaptcha 被取消")
             result = False
         except RecursionError:
+            try:
+                sys.stdout = _old_stdout
+            except NameError:
+                pass
             # Botright 内部 retry 超过 15 次，本局打不过，reset 重开
             log.warning(f"  [尝试{attempt_no}] Botright RecursionError（retry上限），reset 重开")
             result = False
         except Exception as e:
+            try:
+                sys.stdout = _old_stdout
+            except NameError:
+                pass
             log.warning(f"  [尝试{attempt_no}] 异常: {type(e).__name__}: {e}")
             result = False
 
