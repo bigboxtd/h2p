@@ -334,6 +334,48 @@ async def read_delete_date(page) -> str | None:
         log.warning(f"读取到期时间失败: {e}")
     return None
 
+# ==============================================================================
+# ★ 新增：通用看门狗包装器
+# ------------------------------------------------------------------------------
+# 背景：CDP/代理偶发异常（如 gzip abort）会让连接处于"半残"状态——既不报错也不
+# 返回，导致 page.evaluate() / mouse.click() / bounding_box() 这类没有自带超时的
+# 协议级调用直接卡死数分钟（曾观察到卡住 8 分 22 秒），而外层 try/except 完全
+# 捕获不到（因为它根本没有抛异常，只是没返回）。
+# 用 asyncio.wait_for 强制给这些调用加超时，超时就当作失败处理，绝不无限期等待。
+# ==============================================================================
+class WatchdogTimeout(Exception):
+    """标记一次操作被看门狗强制中断（而非业务逻辑本身的异常）"""
+    pass
+
+async def with_watchdog(coro, timeout: float, label: str = ""):
+    """
+    给任意协程加硬超时。超时后抛出 WatchdogTimeout，调用方据此判断是否需要
+    page.reload() / 跳过本次尝试，而不是傻等。
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        log.warning(f"  [看门狗] ⚠️ 操作超时（{timeout}s）: {label or '未命名操作'}，强制放弃等待")
+        raise WatchdogTimeout(f"{label} 超过 {timeout}s 未完成") from None
+
+async def safe_reload(page, timeout_ms: int = 20000, label: str = "") -> bool:
+    """
+    安全地刷新页面：goto 自身的 timeout 参数有时在 CDP 半残状态下也不可靠，
+    所以额外用看门狗包一层硬超时，双重保险。
+    """
+    try:
+        await with_watchdog(
+            page.reload(wait_until="domcontentloaded", timeout=timeout_ms),
+            timeout=(timeout_ms / 1000) + 10,
+            label=f"safe_reload {label}",
+        )
+        return True
+    except WatchdogTimeout:
+        return False
+    except Exception as e:
+        log.warning(f"  [safe_reload] {label} 异常: {e}")
+        return False
+
 async def close_ads(page):
     """
     关闭各种广告弹窗和遮挡层。
@@ -352,7 +394,8 @@ async def close_ads(page):
         try:
             btn = page.locator(sel).first
             if await btn.is_visible(timeout=400):
-                await btn.click()
+                # ★ click() 无自带超时，CDP半残时会无限挂起，加看门狗硬超时
+                await with_watchdog(btn.click(timeout=5000), timeout=8, label=f"close_ads click {sel}")
                 log.info(f"  [close_ads] 关闭广告: {sel}")
                 await asyncio.sleep(0.3)
         except:
@@ -360,7 +403,9 @@ async def close_ads(page):
 
     # 2. JS 强制移除所有高 z-index 的遮挡层（购物广告、iframe 广告等）
     try:
-        removed = await page.evaluate("""() => {
+        # ★ page.evaluate() 没有自带超时参数，CDP半残/代理卡顿时会无限期挂起
+        # （曾实测卡住超过8分钟），用看门狗硬超时兜底
+        removed = await with_watchdog(page.evaluate("""() => {
             let removed = 0;
             const isProtected = (el) => {
                 // 保护 recaptcha / swal / cmp / gdpr 相关元素，以及它们的任意祖先
@@ -399,13 +444,15 @@ async def close_ads(page):
             }
             // 把删了哪些元素也返回出来，方便调试
             return {count: removed, els: removed_els.slice(0, 20)};
-        }""")
+        }"""), timeout=8, label="close_ads JS evaluate")
         count = removed.get("count", 0) if isinstance(removed, dict) else removed
         els_info = removed.get("els", []) if isinstance(removed, dict) else []
         if count > 0:
             log.info(f"  [close_ads] JS 强制移除了 {count} 个遮挡层: {els_info}")
         else:
             log.debug("  [close_ads] JS 未移除任何遮挡层")
+    except WatchdogTimeout:
+        log.warning("  [close_ads] JS evaluate 超时，跳过遮挡层清理")
     except Exception as e:
         log.debug(f"  [close_ads] JS 移除失败: {e}")
 
@@ -422,7 +469,8 @@ async def close_ads(page):
         try:
             _ad_el = page.locator(_ad_sel).first
             if await _ad_el.is_visible(timeout=300):
-                await page.evaluate("(el) => el.remove()", await _ad_el.element_handle())
+                _handle = await with_watchdog(_ad_el.element_handle(timeout=3000), timeout=6, label="bottom_ad element_handle")
+                await with_watchdog(page.evaluate("(el) => el.remove()", _handle), timeout=6, label="bottom_ad remove")
                 log.info(f"  [close_ads] 底部广告条已移除: {_ad_sel}")
         except:
             pass
@@ -469,7 +517,7 @@ async def dismiss_google_vignette(page):
             try:
                 btn = page.locator(sel).first
                 if await btn.is_visible(timeout=400):
-                    await btn.click()
+                    await with_watchdog(btn.click(timeout=5000), timeout=8, label=f"vignette click {sel}")
                     log.info(f"  [vignette] ✅ 点击 Close 关闭 Vignette: {sel}")
                     await asyncio.sleep(1)
                     return True
@@ -1769,7 +1817,9 @@ async def solve_recaptcha(page, url: str = "") -> bool:
             _wait = random.uniform(3, 5)
             log.info(f"  尝试{attempt}失败，等待{_wait:.0f}s后重新加载页面...")
             await asyncio.sleep(_wait)
-            try:
+
+            async def _do_reset_before_retry():
+                """整段'重试前页面重置'逻辑，被外层看门狗硬超时包裹"""
                 log.info(f"  [重试前] 重新导航到续期页面，获取干净的 reCAPTCHA session...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=20000)
                 await asyncio.sleep(2)
@@ -1784,9 +1834,14 @@ async def solve_recaptcha(page, url: str = "") -> bool:
                         if await _rb.is_visible(timeout=3000):
                             _rbox = await _rb.bounding_box(timeout=5000)
                             if _rbox:
-                                await page.mouse.click(
-                                    _rbox["x"] + _rbox["width"] / 2,
-                                    _rbox["y"] + _rbox["height"] / 2
+                                # ★ mouse.click 走 CDP，没有自带超时，CDP半残时会无限挂起，加看门狗
+                                await with_watchdog(
+                                    page.mouse.click(
+                                        _rbox["x"] + _rbox["width"] / 2,
+                                        _rbox["y"] + _rbox["height"] / 2
+                                    ),
+                                    timeout=8,
+                                    label=f"重试前 mouse.click {_rs}",
                                 )
                                 log.info(f"  [重试前] ✅ 重新点击 Renew server ({_rs})")
                                 _re_clicked = True
@@ -1810,6 +1865,18 @@ async def solve_recaptcha(page, url: str = "") -> bool:
                     await close_ads(page)
                     await asyncio.sleep(2)
                     log.info("  [重试前] 页面已重置，下次 attempt 从干净状态开始")
+
+            try:
+                # ★ 关键修复：整段重置流程曾因 CDP/代理半残卡死 8 分22秒。
+                # 给它整体加一个 60s 硬看门狗——超时就放弃本次重置，
+                # 直接进入下一个 attempt（attempt 内部仍会再做一次 goto/检测，
+                # 总比卡死一两个小时直到 GitHub Actions 25 分钟超时强制杀进程好）。
+                await with_watchdog(_do_reset_before_retry(), timeout=60, label=f"尝试{attempt}重试前页面重置")
+            except WatchdogTimeout:
+                log.warning(f"  [重试前] ⚠️ 整段重置超过60s仍未完成，疑似CDP/代理半残，放弃本次重置，直接进入下一 attempt")
+                # 尝试做一次最后的硬刷新，给下一个 attempt 一个干净起点；
+                # 如果连这个都卡住，safe_reload 内部也有看门狗兜底，绝不会无限期挂起
+                await safe_reload(page, timeout_ms=15000, label=f"尝试{attempt}超时后兜底刷新")
             except Exception as _reload_e:
                 log.warning(f"  [重试前] 页面重置失败（{_reload_e}），继续重试（可能失败）")
 
